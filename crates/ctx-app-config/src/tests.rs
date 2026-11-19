@@ -205,6 +205,22 @@ fn empty_config_runtime_defaults_match_public_control_inventory() {
 }
 
 #[test]
+fn blame_refresh_defaults_to_background_and_accepts_on_demand_with_a_ttl() {
+    let mut config = AppConfig::default();
+    assert_eq!(config.blame.refresh, BlameRefresh::Background);
+    assert_eq!(config.blame.on_demand_ttl, DEFAULT_BLAME_ON_DEMAND_TTL);
+    let values =
+        parse_toml_subset("[blame]\nrefresh = \"on_demand\"\non_demand_ttl_seconds = 60\n")
+            .unwrap();
+    config.apply_values(&values).unwrap();
+    assert!(config.blame.enabled);
+    assert_eq!(config.blame.refresh, BlameRefresh::OnDemand);
+    assert_eq!(config.blame.on_demand_ttl, Duration::from_secs(60));
+    let values = parse_toml_subset("[blame]\nrefresh = \"sometimes\"\n").unwrap();
+    assert!(AppConfig::default().apply_values(&values).is_err());
+}
+
+#[test]
 fn blame_indexing_can_be_disabled_without_changing_history_or_semantic_policy() {
     let values = parse_toml_subset("[blame]\nenabled = false\n").unwrap();
     let mut config = AppConfig::default();

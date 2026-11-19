@@ -263,6 +263,10 @@ struct WatchCounters {
     backend_errors: u64,
     rescan_notifications: u64,
     last_relevant_path: Option<PathBuf>,
+    rearm_events: u64,
+    last_rearm_path: Option<PathBuf>,
+    last_rearm_kind: Option<String>,
+    last_rescan_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -539,6 +543,10 @@ impl DaemonFileWatcher {
             "last_ignored_access_path": counters.last_ignored_access_path,
             "backend_errors": counters.backend_errors,
             "rescan_notifications": counters.rescan_notifications,
+            "rearm_events": counters.rearm_events,
+            "last_rearm_path": counters.last_rearm_path,
+            "last_rearm_kind": counters.last_rearm_kind,
+            "last_rescan_kind": counters.last_rescan_kind,
             "ingress_overflows": runtime.ingress_overflows,
             "ingress_disconnects": runtime.ingress_disconnects,
             "coalesced_wakeups": runtime.coalesced_wakeups,

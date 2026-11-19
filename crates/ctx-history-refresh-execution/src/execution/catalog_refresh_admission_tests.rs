@@ -189,19 +189,42 @@ fn member_fallback_requires_failure_and_runs_only_once() {
         logical_source_retryable_failure_total: 0,
     };
 
+    let exempt = BTreeSet::from([outcome.route_identity.clone()]);
     assert!(!exact_member_family_fallback_required(
         &members,
+        &BTreeSet::new(),
         std::slice::from_ref(&outcome),
         &[],
     ));
     outcome.logical_source_failure_total = 1;
     assert!(exact_member_family_fallback_required(
         &members,
+        &BTreeSet::new(),
         std::slice::from_ref(&outcome),
         &[]
     ));
     assert!(!exact_member_family_fallback_required(
+        &members,
+        &exempt,
+        std::slice::from_ref(&outcome),
+        &[]
+    ));
+    let failed = SourceBackedFailedRouteOutcome {
+        route_identity: outcome.route_identity.clone(),
+        source_identity: "source".to_owned(),
+        provider: CaptureProvider::Claude,
+        class: SourceBackedSourceFailureClass::Unavailable,
+        carried_forward: false,
+    };
+    assert!(exact_member_family_fallback_required(
+        &members,
+        &exempt,
+        &[],
+        std::slice::from_ref(&failed),
+    ));
+    assert!(!exact_member_family_fallback_required(
         &BTreeMap::new(),
+        &BTreeSet::new(),
         &[outcome],
         &[],
     ));

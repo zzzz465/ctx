@@ -57,6 +57,7 @@ pub(super) fn record_watch_event(
         counters.raw_events = counters.raw_events.saturating_add(1);
         counters.rescan_notifications = counters.rescan_notifications.saturating_add(1);
         counters.last_relevant_path = event.paths.first().cloned();
+        counters.last_rescan_kind = event.rearm_kind().map(str::to_owned);
         drop(counters);
         return SourceWatchBatch::uncertainty(watermark);
     }
@@ -77,6 +78,7 @@ pub(super) fn record_watch_event(
     let mut matched_path = false;
     let mut unmatched_path = false;
     let mut data_root_invalidated = false;
+    let mut registration_changed = false;
     for event_path in &event.paths {
         if event_path.as_path() == data_root {
             data_root_invalidated |= event.requires_rearm();
@@ -93,6 +95,7 @@ pub(super) fn record_watch_event(
             .any(|target| declared_control_paths_overlap(target, event_path));
         if control_matched {
             batch.reconcile = Some(watermark);
+            registration_changed = true;
             path_matched = true;
             relevant_path.get_or_insert_with(|| event_path.clone());
         }
@@ -102,13 +105,24 @@ pub(super) fn record_watch_event(
         }
         if let Some(catalog) = catalog.as_ref() {
             for route in catalog.routes_overlapping_path(event_path) {
+                // A rename whose destination is a known non-source file leaves
+                // route membership alone; a renamed-away member still rearms
+                // through the event for its old, now missing, path.
                 if !control_matched
-                    && !event.requires_rearm()
+                    && (!event.requires_rearm() || event.is_rename())
                     && catalog.event_is_known_non_source_file(&route, event_path)
                 {
                     continue;
                 }
+                if !control_matched
+                    && !event.requires_rearm()
+                    && catalog.event_leaves_route_targets_missing(&route, event_path)
+                {
+                    continue;
+                }
                 path_matched = true;
+                registration_changed |= !(event.is_folder_creation()
+                    && catalog.event_is_directory_inside_recursive_tree(&route, event_path));
                 let member = catalog.exact_member_for_event(&route, event_path);
                 batch.record_route(route, watermark, member);
                 relevant_path.get_or_insert_with(|| event_path.clone());
@@ -124,8 +138,14 @@ pub(super) fn record_watch_event(
         record_relevant_watch_event(counters, event.paths.first().cloned());
         return SourceWatchBatch::uncertainty(watermark);
     }
-    if !batch.is_empty() && event.requires_rearm() {
+    if !batch.is_empty() && event.requires_rearm() && registration_changed {
         batch.rearm = true;
+        let mut counters = counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counters.rearm_events = counters.rearm_events.saturating_add(1);
+        counters.last_rearm_path = event.paths.first().cloned();
+        counters.last_rearm_kind = event.rearm_kind().map(str::to_owned);
     }
     drop(authority_snapshot);
     if !batch.is_empty() {

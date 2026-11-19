@@ -172,6 +172,12 @@ pub(super) fn refresh_all_provider_sources_route_local_with_reconciliation(
     // generation and make restart skip them. A pre-scan token is either bound
     // to the captured state or conservatively forces the next warm refresh.
     let admitted_route_observations = admitted_route_observations(&build.registry, &physical_scope);
+    let source_failure_exempt_routes = build
+        .registry
+        .routes()
+        .filter(|route| route.source.provider == CaptureProvider::Claude)
+        .filter_map(|route| route.route_identity.clone())
+        .collect::<BTreeSet<_>>();
     let writer_options = if build
         .registry
         .selected_routes_use_parallel_leaf_workers(&physical_scope)
@@ -227,6 +233,7 @@ pub(super) fn refresh_all_provider_sources_route_local_with_reconciliation(
                 if exact_catalog_members
                     && exact_member_family_fallback_required(
                         &route_worksets,
+                        &source_failure_exempt_routes,
                         successful_route_outcomes,
                         &failed_routes,
                     )

@@ -115,18 +115,37 @@ fn frozen_jsonl_append_publishes_new_peers_and_recovers_all_deferred_rows() {
                     });
                     assert!(receipt.failed_routes.is_empty(), "{receipt:?}");
                     assert!(receipt.logical_source_failures.is_empty(), "{receipt:?}");
-                    assert_eq!(receipt.complete_inventory_route_ids.len(), 1);
+                    // A warm Claude member refresh may open only the named
+                    // transcript; peers then wait for their own member or for
+                    // the next exhaustive refresh.
+                    let member_only = receipt.complete_inventory_route_ids.is_empty();
+                    assert!(
+                        !member_only
+                            || (provider == CaptureProvider::Claude && exact_member && warm),
+                        "provider={provider:?}, warm={warm}, at={at:?}, member={exact_member}"
+                    );
                     let expected: &[&str] = if at == RaceAt::Discovery {
                         &["first", "second", "third"]
                     } else {
                         &["first", "second"]
                     };
                     assert_literal_bodies(&indexed_records(&index, provider, "racing"), expected);
-                    assert_literal_bodies(
-                        &indexed_records(&index, provider, "peer"),
-                        &["first", "peer new"],
-                    );
-                    assert!(indexed_records(&index, provider, "missing").is_empty());
+                    if member_only {
+                        assert_literal_bodies(
+                            &indexed_records(&index, provider, "peer"),
+                            &["first"],
+                        );
+                        assert_literal_bodies(
+                            &indexed_records(&index, provider, "missing"),
+                            &["first"],
+                        );
+                    } else {
+                        assert_literal_bodies(
+                            &indexed_records(&index, provider, "peer"),
+                            &["first", "peer new"],
+                        );
+                        assert!(indexed_records(&index, provider, "missing").is_empty());
+                    }
                     let recovered =
                         refresh_source_backed_generation(&index, &registry, writer_options())
                             .unwrap();
@@ -139,6 +158,7 @@ fn frozen_jsonl_append_publishes_new_peers_and_recovers_all_deferred_rows() {
                         &indexed_records(&index, provider, "peer"),
                         &["first", "peer new"],
                     );
+                    assert!(indexed_records(&index, provider, "missing").is_empty());
                 }
             }
         }

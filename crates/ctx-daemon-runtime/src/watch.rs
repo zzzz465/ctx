@@ -46,6 +46,9 @@ pub struct NativeWatchEvent {
     needs_rescan: bool,
     requires_rearm: bool,
     ignored: Option<NativeWatchIgnore>,
+    rearm_kind: Option<String>,
+    renamed: bool,
+    created_folder: bool,
 }
 
 impl NativeWatchEvent {
@@ -55,6 +58,9 @@ impl NativeWatchEvent {
             needs_rescan: false,
             requires_rearm: false,
             ignored: None,
+            rearm_kind: None,
+            renamed: false,
+            created_folder: false,
         }
     }
 
@@ -65,12 +71,29 @@ impl NativeWatchEvent {
         }
     }
 
+    pub fn renamed(paths: Vec<PathBuf>) -> Self {
+        Self {
+            renamed: true,
+            ..Self::requiring_rearm(paths)
+        }
+    }
+
+    pub fn created_folder(paths: Vec<PathBuf>) -> Self {
+        Self {
+            created_folder: true,
+            ..Self::requiring_rearm(paths)
+        }
+    }
+
     pub fn rescan(paths: Vec<PathBuf>) -> Self {
         Self {
             paths,
             needs_rescan: true,
             requires_rearm: true,
             ignored: None,
+            rearm_kind: None,
+            renamed: false,
+            created_folder: false,
         }
     }
 
@@ -87,6 +110,21 @@ impl NativeWatchEvent {
 
     pub fn requires_rearm(&self) -> bool {
         self.requires_rearm
+    }
+
+    /// A rename reports its old and new path as separate events, so the event
+    /// for a path that still exists describes the destination only.
+    pub fn is_rename(&self) -> bool {
+        self.renamed
+    }
+
+    pub fn is_folder_creation(&self) -> bool {
+        self.created_folder
+    }
+
+    /// Diagnostic label of the native kind that asked for a watcher rearm.
+    pub fn rearm_kind(&self) -> Option<&str> {
+        self.rearm_kind.as_deref()
     }
 
     pub fn ignored_kind(&self) -> Option<NativeWatchIgnore> {
@@ -123,11 +161,23 @@ fn normalize_native_watch_event(event: notify::Result<Event>) -> NativeWatchResu
             | EventKind::Remove(RemoveKind::Any | RemoveKind::Folder | RemoveKind::Other)
     );
     let needs_rescan = event.need_rescan();
+    let renamed = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)));
+    let created_folder = matches!(event.kind, EventKind::Create(CreateKind::Folder));
+    let rearm_kind = (requires_rearm || needs_rescan).then(|| {
+        if needs_rescan {
+            format!("rescan:{:?}", event.info())
+        } else {
+            format!("{:?}", event.kind)
+        }
+    });
     Ok(NativeWatchEvent {
         paths: event.paths,
         needs_rescan,
         requires_rearm,
         ignored,
+        rearm_kind,
+        renamed,
+        created_folder,
     })
 }
 

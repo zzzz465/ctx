@@ -284,7 +284,7 @@ pub(in super::super) fn prepare_leaf_with_resources<R: JsonlFamilyRuntime>(
     }
     let mut projector = adapter.projector_with_provider_checkpoint(
         &leaf,
-        opened,
+        Arc::clone(&opened),
         DateTime::<Utc>::UNIX_EPOCH,
         resumed.and_then(|checkpoint| checkpoint.provider_checkpoint.as_ref()),
         base.is_some().then(|| base_event_lookup.clone()),
@@ -315,21 +315,75 @@ pub(in super::super) fn prepare_leaf_with_resources<R: JsonlFamilyRuntime>(
             Err(JsonlFamilyProjectorPreflightError::Internal(error)) => return Err(error),
         };
         let source_failed = logical_source_quarantine.is_some();
-        let physical_ready =
-            reader.settle_semantic_preflight(initial, !retry && !source_failed, true)?;
-        if source_failed {
+        if reader.execution_is_direct_append_resume() && (retry || source_failed) {
+            // A direct append reader starts at the certified frontier, so it
+            // cannot replay the prefix a replacement or quarantine must cover.
+            // Reopen from byte zero and repeat preflight over the whole source.
+            reader = open_reader(None)?;
+            projector = adapter.projector_with_provider_checkpoint(
+                &leaf,
+                opened,
+                DateTime::<Utc>::UNIX_EPOCH,
+                None,
+                Some(base_event_lookup.clone()),
+                JsonlFamilyProjectionMode::Replacement,
+            )?;
+            logical_source_quarantine = None;
             resumed = None;
             is_append = false;
-        } else {
-            if (retry || !physical_ready) && !is_append {
-                return Err(JsonlRuntimeError::<R>::system_invariant(
-                    "JSONL projector replaced a non-append",
+            let replacement_start = reader.execution_position()?;
+            match projector.preflight_with_failure_scope(&mut reader, None) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(JsonlRuntimeError::<R>::invalid_payload(
+                        "JSONL projector requested more than one replacement retry".to_owned(),
+                    ));
+                }
+                Err(JsonlFamilyProjectorPreflightError::RecordRejection { .. }) => {
+                    return Err(JsonlRuntimeError::<R>::system_invariant(
+                        "JSONL projector leaked a record rejection from preflight",
+                    ));
+                }
+                Err(JsonlFamilyProjectorPreflightError::LogicalSourceFailure {
+                    source,
+                    detail,
+                }) => {
+                    if !source.exact_descriptor_eq(leaf.source()) {
+                        return Err(JsonlRuntimeError::<R>::system_invariant(
+                            "JSONL projector failed another logical source",
+                        ));
+                    }
+                    logical_source_quarantine = Some((*source, detail));
+                }
+                Err(JsonlFamilyProjectorPreflightError::Internal(error)) => return Err(error),
+            }
+            if !reader.settle_semantic_preflight(
+                replacement_start,
+                logical_source_quarantine.is_none(),
+                true,
+            )? && logical_source_quarantine.is_none()
+            {
+                return Err(JsonlRuntimeError::<R>::invalid_payload(
+                    "JSONL projector requested more than one replacement retry".to_owned(),
                 ));
             }
-            if retry || !physical_ready {
-                projector.retry_replacement();
+        } else {
+            let physical_ready =
+                reader.settle_semantic_preflight(initial, !retry && !source_failed, true)?;
+            if source_failed {
                 resumed = None;
                 is_append = false;
+            } else {
+                if (retry || !physical_ready) && !is_append {
+                    return Err(JsonlRuntimeError::<R>::system_invariant(
+                        "JSONL projector replaced a non-append",
+                    ));
+                }
+                if retry || !physical_ready {
+                    projector.retry_replacement();
+                    resumed = None;
+                    is_append = false;
+                }
             }
         }
     }
