@@ -43,6 +43,11 @@ fn query(
     } else {
         BlameRequestKind::FirstRequest
     });
+    // A failed on-demand refresh must not hide committed data: the query
+    // below still reports its own freshness.
+    let _ = crate::semantic::refresh_blame_on_demand(data_root, &|| {
+        ctx_daemon_cli::foreground_checkpoint().is_err()
+    });
     let started = Instant::now();
     let result = ctx_attribution::query(data_root, target, limit, cursor);
     facts.query_duration = Some(started.elapsed());

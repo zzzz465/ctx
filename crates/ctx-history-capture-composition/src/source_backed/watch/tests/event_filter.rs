@@ -36,6 +36,45 @@ fn codex_tree_filter_keeps_rollouts_and_uncertain_paths() {
 }
 
 #[test]
+fn ancestor_event_is_ignored_only_while_the_route_target_stays_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let ancestor = temp.path().join("globalStorage");
+    fs::create_dir_all(&ancestor).unwrap();
+    let root = ancestor.join("extension");
+    let (catalog, route) = catalog_for(automatic_route(
+        CaptureProvider::Claude,
+        root.clone(),
+        "claude_projects_jsonl_tree",
+    ));
+    assert!(catalog.event_leaves_route_targets_missing(&route, &ancestor));
+    assert!(catalog.event_leaves_route_targets_missing(&route, temp.path()));
+    assert!(!catalog.event_leaves_route_targets_missing(&route, &root));
+    assert!(!catalog.event_leaves_route_targets_missing(&route, &ancestor.join("sibling")));
+    fs::create_dir(&root).unwrap();
+    assert!(!catalog.event_leaves_route_targets_missing(&route, &ancestor));
+}
+
+#[test]
+fn new_directory_inside_a_claude_tree_needs_no_registration_of_its_own() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("projects");
+    let session = root.join("project").join("session");
+    fs::create_dir_all(&session).unwrap();
+    let file = root.join("project").join("session.jsonl");
+    fs::write(&file, b"{}\n").unwrap();
+    let (catalog, route) = catalog_for(automatic_route(
+        CaptureProvider::Claude,
+        root.clone(),
+        "claude_projects_jsonl_tree",
+    ));
+    assert!(catalog.event_is_directory_inside_recursive_tree(&route, &session));
+    assert!(!catalog.event_is_directory_inside_recursive_tree(&route, &root));
+    assert!(!catalog.event_is_directory_inside_recursive_tree(&route, &file));
+    assert!(!catalog.event_is_directory_inside_recursive_tree(&route, &root.join("missing")));
+    assert!(!catalog.event_is_directory_inside_recursive_tree(&route, temp.path()));
+}
+
+#[test]
 fn claude_tree_filter_keeps_transcripts_and_uncertain_paths() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("projects");

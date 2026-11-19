@@ -70,7 +70,7 @@ impl MetadataWatcher {
                                 return;
                             }
                             let kind = match root.entries.get(path) {
-                                None => Some(EventKind::Create(CreateKind::Any)),
+                                None => Some(EventKind::Create(created_kind(stamp))),
                                 Some(old) if old != stamp => Some(EventKind::Modify(
                                     ModifyKind::Metadata(MetadataKind::WriteTime),
                                 )),
@@ -80,15 +80,15 @@ impl MetadataWatcher {
                                 handler(Ok(Event::new(kind).add_path(path.clone())));
                             }
                         }
-                        for path in root
+                        for (path, stamp) in root
                             .entries
-                            .keys()
-                            .filter(|path| !current.contains_key(*path))
+                            .iter()
+                            .filter(|(path, _)| !current.contains_key(*path))
                         {
                             if canceled.load(Ordering::Acquire) {
                                 return;
                             }
-                            handler(Ok(Event::new(EventKind::Remove(RemoveKind::Any))
+                            handler(Ok(Event::new(EventKind::Remove(removed_kind(stamp)))
                                 .add_path(path.clone())));
                         }
                         root.entries = current;
@@ -133,6 +133,24 @@ impl Drop for MetadataWatcher {
         self.stop();
     }
 }
+// An ordinary file needs no watcher rearm, so it must not be reported with the
+// `Any` kind that the event router treats as a registration change.
+fn created_kind(stamp: &Stamp) -> CreateKind {
+    match stamp.kind {
+        0 => CreateKind::File,
+        1 => CreateKind::Folder,
+        _ => CreateKind::Any,
+    }
+}
+
+fn removed_kind(stamp: &Stamp) -> RemoveKind {
+    match stamp.kind {
+        0 => RemoveKind::File,
+        1 => RemoveKind::Folder,
+        _ => RemoveKind::Any,
+    }
+}
+
 fn scan(
     root: &Path,
     recursive: bool,
@@ -221,6 +239,46 @@ mod tests {
             .expect("same-time size change must be observed")
             .unwrap();
         assert!(event.paths.contains(&path));
+    }
+
+    #[test]
+    fn created_and_removed_entries_report_their_file_type() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = MetadataWatcher::new(Arc::new(move |event| {
+            let _ = tx.send(event);
+        }))
+        .unwrap();
+        watcher
+            .watch(temp.path(), RecursiveMode::Recursive)
+            .unwrap();
+        let file = temp.path().join("new.jsonl");
+        let folder = temp.path().join("subagents");
+        std::fs::write(&file, b"first\n").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let mut seen = BTreeMap::new();
+        while seen.len() < 2 {
+            let event = rx
+                .recv_timeout(Duration::from_secs(8))
+                .expect("created entries must be observed")
+                .unwrap();
+            if event.paths.contains(&file) || event.paths.contains(&folder) {
+                seen.insert(event.paths[0].clone(), event.kind);
+            }
+        }
+        assert_eq!(seen[&file], EventKind::Create(CreateKind::File));
+        assert_eq!(seen[&folder], EventKind::Create(CreateKind::Folder));
+        std::fs::remove_file(&file).unwrap();
+        let removed = loop {
+            let event = rx
+                .recv_timeout(Duration::from_secs(8))
+                .expect("removed file must be observed")
+                .unwrap();
+            if event.paths.contains(&file) {
+                break event.kind;
+            }
+        };
+        assert_eq!(removed, EventKind::Remove(RemoveKind::File));
     }
 
     #[test]

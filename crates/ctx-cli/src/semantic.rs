@@ -230,10 +230,47 @@ fn reconcile_current_attribution(
     data_root: &Path,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<()> {
-    if !ctx_app_config::AppConfig::load(data_root)?.blame.enabled {
+    let blame = ctx_app_config::AppConfig::load(data_root)?.blame;
+    if !blame.enabled || blame.refresh == ctx_app_config::BlameRefresh::OnDemand {
         return Ok(());
     }
     ctx_attribution::catch_up_current(data_root, cancelled)?;
+    Ok(())
+}
+
+const ON_DEMAND_BLAME_REFRESH_MARKER: &str = "blame-on-demand-refresh";
+
+fn on_demand_blame_refresh_marker(data_root: &Path) -> std::path::PathBuf {
+    data_root.join("runtime").join(ON_DEMAND_BLAME_REFRESH_MARKER)
+}
+
+fn on_demand_blame_refresh_is_fresh(marker: &Path, ttl: std::time::Duration) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < ttl)
+}
+
+/// Brings Blame up to current Core in the calling query when background
+/// refresh is turned off. A completed refresh is reused for the configured TTL.
+pub(crate) fn refresh_blame_on_demand(
+    data_root: &Path,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<()> {
+    let blame = ctx_app_config::AppConfig::load(data_root)?.blame;
+    if !blame.enabled || blame.refresh != ctx_app_config::BlameRefresh::OnDemand {
+        return Ok(());
+    }
+    let marker = on_demand_blame_refresh_marker(data_root);
+    if on_demand_blame_refresh_is_fresh(&marker, blame.on_demand_ttl) {
+        return Ok(());
+    }
+    ctx_attribution::catch_up_current(data_root, cancelled)?;
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&marker, b"")?;
     Ok(())
 }
 

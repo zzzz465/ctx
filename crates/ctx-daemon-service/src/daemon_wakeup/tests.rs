@@ -922,6 +922,55 @@ fn forced_rearm_emits_only_the_route_mutated_during_registration_overlap() {
 }
 
 #[test]
+fn rename_to_a_claude_non_source_file_does_not_rearm_the_watcher() {
+    let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let data_root = temp.path().join("ctx-data");
+    let daemon_root = data_root.join("daemon");
+    let projects = temp.path().join("projects");
+    let subagents = projects.join("project/session/subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    let metadata = subagents.join("agent-1.meta.json");
+    fs::write(&metadata, b"{}").unwrap();
+    let catalog = watch_catalog([catalog_route(
+        CaptureProvider::Claude,
+        projects.clone(),
+        "claude_projects_jsonl_tree",
+    )]);
+    let authority = RwLock::new(watch_authority(&data_root, catalog));
+    let counters = Mutex::new(WatchCounters::default());
+    let record = |event: NativeWatchEvent, sequence: u64| {
+        record_watch_event(
+            &authority,
+            &counters,
+            &data_root,
+            &daemon_root,
+            Ok(event),
+            EventWatermark::new(1, sequence),
+        )
+    };
+
+    assert!(record(NativeWatchEvent::renamed(vec![metadata.clone()]), 1).is_empty());
+    let other = record(NativeWatchEvent::requiring_rearm(vec![metadata]), 2);
+    assert!(other.rearm);
+    let renamed_away = record(
+        NativeWatchEvent::renamed(vec![projects.join("project/session.jsonl")]),
+        3,
+    );
+    assert!(renamed_away.rearm);
+
+    let session = projects.join("project/session/tool-results");
+    fs::create_dir_all(&session).unwrap();
+    let created = record(NativeWatchEvent::created_folder(vec![session]), 4);
+    assert_eq!(created.routes.len(), 1);
+    assert!(!created.rearm);
+    let outside = record(
+        NativeWatchEvent::created_folder(vec![projects.clone()]),
+        5,
+    );
+    assert!(outside.rearm);
+}
+
+#[test]
 fn rescan_and_backend_errors_require_catalog_reconciliation_and_rearm() {
     let data_root = Path::new("/tmp/ctx-data");
     let daemon_root = data_root.join("daemon");

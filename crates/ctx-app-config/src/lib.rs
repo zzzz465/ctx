@@ -134,7 +134,26 @@ pub struct AnalyticsConfig {
 #[derive(Debug, Clone)]
 pub struct BlameConfig {
     pub enabled: bool,
+    pub refresh: BlameRefresh,
+    pub on_demand_ttl: Duration,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlameRefresh {
+    Background,
+    OnDemand,
+}
+
+impl BlameRefresh {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::OnDemand => "on_demand",
+        }
+    }
+}
+
+pub const DEFAULT_BLAME_ON_DEMAND_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct LocalUsageConfig {
@@ -333,7 +352,11 @@ impl Default for AppConfig {
             indexing: IndexingConfig {
                 mode: IndexingMode::Automatic,
             },
-            blame: BlameConfig { enabled: true },
+            blame: BlameConfig {
+                enabled: true,
+                refresh: BlameRefresh::Background,
+                on_demand_ttl: DEFAULT_BLAME_ON_DEMAND_TTL,
+            },
             daemon: DaemonConfig {
                 mode: DaemonMode::Full,
             },
@@ -485,6 +508,19 @@ impl AppConfig {
                 }
                 "blame.enabled" => {
                     self.blame.enabled = parse_config_bool(key, value)?;
+                }
+                "blame.refresh" => {
+                    self.blame.refresh = match parse_non_empty_string(key, value)?.as_str() {
+                        "background" => BlameRefresh::Background,
+                        "on_demand" => BlameRefresh::OnDemand,
+                        other => bail!(
+                            "blame.refresh at line {} must be `background` or `on_demand`, got `{other}`",
+                            value.line
+                        ),
+                    };
+                }
+                "blame.on_demand_ttl_seconds" => {
+                    self.blame.on_demand_ttl = Duration::from_secs(parse_config_u64(key, value)?);
                 }
                 "semantic.executor" => {
                     semantic_executor = Some(parse_non_empty_string(key, value)?);
