@@ -35,6 +35,45 @@ fn codex_tree_filter_keeps_rollouts_and_uncertain_paths() {
     assert!(!catalog.event_is_known_non_source_file(&route, &removed));
 }
 
+#[test]
+fn claude_tree_filter_keeps_transcripts_and_uncertain_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("projects");
+    let session = root.join("project").join("session").join("subagents");
+    fs::create_dir_all(&session).unwrap();
+    let (catalog, route) = catalog_for(automatic_route(
+        CaptureProvider::Claude,
+        root.clone(),
+        "claude_projects_jsonl_tree",
+    ));
+    for (path, ignored) in [
+        (root.join("project").join("session.jsonl"), false),
+        (session.join("agent-a.jsonl"), false),
+        (session.join("agent-a.meta.json"), cfg!(unix)),
+        (
+            root.join("project")
+                .join("session")
+                .join("custom-title.json"),
+            cfg!(unix),
+        ),
+        (
+            root.join("project").join("session.jsonl.backup"),
+            cfg!(unix),
+        ),
+    ] {
+        fs::write(&path, b"fixture\n").unwrap();
+        assert_eq!(
+            catalog.event_is_known_non_source_file(&route, &path),
+            ignored,
+            "{}",
+            path.display()
+        );
+    }
+    for path in [&root, &session, &root.join("project").join("missing.json")] {
+        assert!(!catalog.event_is_known_non_source_file(&route, path));
+    }
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn codex_non_source_filter_retains_hard_link_aliases() {
@@ -79,7 +118,7 @@ fn non_source_filter_requires_one_known_codex_directory_registration() {
         (CaptureProvider::Codex, root.clone(), "codex_history_jsonl"),
         (
             CaptureProvider::Claude,
-            root.clone(),
+            file.clone(),
             "claude_projects_jsonl_tree",
         ),
         (CaptureProvider::OpenCode, file.clone(), "opencode_sqlite"),

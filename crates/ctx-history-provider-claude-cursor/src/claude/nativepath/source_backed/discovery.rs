@@ -38,6 +38,74 @@ pub(super) fn membership<B: ProviderRuntimeBinding>(
     Ok(membership)
 }
 
+/// Binds one watcher-selected transcript exactly as [`discover`] would, without
+/// enumerating the route. Returns `None` whenever only a full discovery can
+/// decide the member's ownership.
+pub(super) fn bind_partial_member<B: ProviderRuntimeBinding>(
+    adapter: &ClaudeJsonlAdapter<B>,
+    member: &ProviderJsonlOpenedMember<'_>,
+) -> Result<Option<ProviderJsonlLeaf>> {
+    let path = member.source_path();
+    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        return Ok(None);
+    }
+    let projects_root = claude_projects_root(member.authority().named_path());
+    let Some((project_dir, layout, key)) = classify_claude_path(&projects_root, path)? else {
+        return Ok(None);
+    };
+    if transcript_repeats_in_sibling_project(&projects_root, &project_dir, path)? {
+        return Ok(None);
+    }
+    let binding = Binding {
+        project_dir,
+        source_root_lineage: adapter.source_root_lineage,
+        key,
+        layout,
+    };
+    let source = source_key(binding.source_root_lineage, &binding.key)?;
+    let proof = TypedKey::bytes(serde_json::to_vec(&binding)?).map_err(contract)?;
+    Ok(Some(ProviderJsonlLeaf::bind_frozen_observed(
+        source,
+        path.to_path_buf(),
+        Arc::clone(member.authority()),
+        member.authority_path().to_path_buf(),
+        proof,
+        member.observation().clone(),
+    )))
+}
+
+// The source key omits the project directory, so the same relative transcript
+// path under another project claims the same source. Discovery quarantines
+// every such claimant; a partial refresh must not update one of them.
+fn transcript_repeats_in_sibling_project(
+    projects_root: &Path,
+    project_dir: &Path,
+    path: &Path,
+) -> Result<bool> {
+    if project_dir == projects_root {
+        return Ok(false);
+    }
+    let Ok(inner) = path.strip_prefix(project_dir) else {
+        return Ok(true);
+    };
+    for entry in std::fs::read_dir(projects_root)? {
+        let sibling = entry?.path();
+        if sibling == project_dir {
+            continue;
+        }
+        match std::fs::symlink_metadata(sibling.join(inner)) {
+            Ok(_) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn discover<B: ProviderRuntimeBinding>(
     adapter: &ClaudeJsonlAdapter<B>,
     root: &Path,

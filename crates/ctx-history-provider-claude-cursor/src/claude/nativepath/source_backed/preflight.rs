@@ -213,6 +213,7 @@ pub(super) fn validate_source(
     source: &SourceKey,
     session_id: StableEntityId,
     certified_prefix_end: Option<u64>,
+    base_contains_event: &dyn Fn(StableEntityId) -> std::result::Result<bool, CaptureError>,
     duplicate_plan: &mut ClaudeDuplicatePlan,
 ) -> std::result::Result<bool, ClaudePreflightError> {
     duplicate_plan.clear();
@@ -253,23 +254,37 @@ pub(super) fn validate_source(
                             "Claude preflight record identity allocation failed",
                         ))
                     })?;
+                let in_certified_prefix =
+                    certified_prefix_end.is_some_and(|end| evidence.byte_end_exclusive() <= end);
+                let mut repeats_base_event = false;
                 for row in &parsed.rows {
                     match stable_native_event_identity(row, source, session_id) {
-                        Ok(Some(event_id)) => record_identities.push(ClaudePreflightIdentity {
-                            event_digest: event_id.digest(),
-                            source_record_ordinal: row.identity.source_record_ordinal,
-                            source_subrecord_index: u16::try_from(
-                                row.identity.source_subrecord_index,
-                            )
-                            .map_err(|_| {
-                                ClaudePreflightError::internal(CaptureError::SystemInvariant(
+                        Ok(Some(event_id)) => {
+                            // A direct append pass starts at the certified
+                            // frontier, so the committed base is the only
+                            // witness that a suffix row repeats a prefix row.
+                            if certified_prefix_end.is_some()
+                                && !in_certified_prefix
+                                && !repeats_base_event
+                            {
+                                repeats_base_event = base_contains_event(event_id)
+                                    .map_err(ClaudePreflightError::internal)?;
+                            }
+                            record_identities.push(ClaudePreflightIdentity {
+                                event_digest: event_id.digest(),
+                                source_record_ordinal: row.identity.source_record_ordinal,
+                                source_subrecord_index: u16::try_from(
+                                    row.identity.source_subrecord_index,
+                                )
+                                .map_err(|_| {
+                                    ClaudePreflightError::internal(CaptureError::SystemInvariant(
                                     "Claude preflight subrecord identity exceeded its parser bound",
                                 ))
-                            })?,
-                            kind: row.kind,
-                            in_certified_prefix: certified_prefix_end
-                                .is_some_and(|end| evidence.byte_end_exclusive() <= end),
-                        }),
+                                })?,
+                                kind: row.kind,
+                                in_certified_prefix,
+                            })
+                        }
                         Ok(None) => {}
                         Err(error) => match scope_claude_row_validation_error(error) {
                             ClaudePreflightError::RecordRejection { .. } => return Ok(()),
@@ -296,6 +311,7 @@ pub(super) fn validate_source(
                         ))
                     })?;
                 identities.extend(record_identities);
+                requires_replacement |= repeats_base_event;
                 Ok(())
             },
         )?

@@ -34,8 +34,8 @@ use ctx_history_provider_runtime::{
     source_io::{OpenedProviderSourceFile, ProviderSourceRoot},
     CaptureError, JsonlAppendOccurrenceState, JsonlFamilyAppendMode, JsonlFamilyProjectionMode,
     JsonlFamilyProjector, JsonlFamilyRejectedLeaf, JsonlRecordRef, ProviderBaseEventLookup,
-    ProviderJsonlInventory, ProviderJsonlLeaf, ProviderJsonlReader, ProviderJsonlRuntime,
-    ProviderJsonlWorkerContext, ProviderRuntimeBinding, Result,
+    ProviderJsonlInventory, ProviderJsonlLeaf, ProviderJsonlOpenedMember, ProviderJsonlReader,
+    ProviderJsonlRuntime, ProviderJsonlWorkerContext, ProviderRuntimeBinding, Result,
 };
 
 type JsonlFamilyLeaf = ProviderJsonlLeaf;
@@ -51,6 +51,7 @@ const LOGICAL_SESSION_KIND: &str = "claude-session";
 const LOGICAL_EVENT_KIND: &str = "claude-event";
 const SOURCE_SCHEMA_VARIANT: &str = "claude-nativepath-jsonl-v6";
 const PARSER_REVISION: &str = "claude-shared-jsonl-core-activity-v3-record-ownership";
+const DIRECT_APPEND_CHECKPOINT: &str = "claude.direct-append.v1";
 
 mod binding;
 mod discovery;
@@ -120,6 +121,21 @@ where
         JsonlFamilyAppendMode::ProjectorPreflight(true)
     }
 
+    // Claude Code only appends to a transcript file. Trusting that lets a
+    // growing transcript resume at its certified frontier instead of being
+    // re-read from byte zero on every refresh.
+    fn append_only_same_object_v1(&self) -> bool {
+        true
+    }
+
+    fn accepts_direct_append_checkpoint(&self, checkpoint: &TypedKey) -> bool {
+        direct_append_checkpoint().is_ok_and(|expected| *checkpoint == expected)
+    }
+
+    fn allows_direct_append_for_leaf(&self, leaf: &ProviderJsonlLeaf) -> bool {
+        leaf.observation().supports_exact_revalidation()
+    }
+
     fn oversized_record_policy(&self) -> JsonlOversizedRecordPolicy {
         JsonlOversizedRecordPolicy::RejectRecord
     }
@@ -130,6 +146,17 @@ where
 
     fn discover(&self, root: &Path) -> Result<ProviderJsonlInventory> {
         discovery::discover(self, root)
+    }
+
+    fn partial_member_roots(&self, root: &Path) -> Option<Vec<PathBuf>> {
+        Some(vec![root.to_path_buf()])
+    }
+
+    fn bind_partial_member(
+        &self,
+        member: &ProviderJsonlOpenedMember<'_>,
+    ) -> Result<Option<ProviderJsonlLeaf>> {
+        discovery::bind_partial_member(self, member)
     }
 
     fn observe_terminal_membership(
@@ -170,6 +197,9 @@ where
                 leaf.source_path().to_string_lossy(),
             ),
             duplicate_plan: ClaudeDuplicatePlan::default(),
+            append_base_lookup: (mode == JsonlFamilyProjectionMode::CertifiedAppend)
+                .then(|| base_event_lookup.clone())
+                .flatten(),
             fallback_identities: match (mode, base_event_lookup) {
                 (JsonlFamilyProjectionMode::CertifiedAppend, Some(base_lookup)) => {
                     JsonlAppendOccurrenceState::for_append(base_lookup)
@@ -178,6 +208,10 @@ where
             },
         }))
     }
+}
+
+fn direct_append_checkpoint() -> Result<TypedKey> {
+    TypedKey::utf8(DIRECT_APPEND_CHECKPOINT).map_err(contract)
 }
 
 struct Identities {
@@ -195,6 +229,7 @@ struct ClaudeProjector<B: ProviderRuntimeBinding> {
     session: ClaudeSessionMetadata,
     rejections: JsonlRecordRejections,
     duplicate_plan: ClaudeDuplicatePlan,
+    append_base_lookup: Option<ProviderBaseEventLookup<B>>,
     fallback_identities: JsonlAppendOccurrenceState<[u8; 32], ProviderBaseEventLookup<B>>,
 }
 
@@ -227,6 +262,7 @@ where
         reader: &mut JsonlReader,
         certified_prefix_end: Option<u64>,
     ) -> std::result::Result<bool, ClaudePreflightError> {
+        let base_lookup = self.append_base_lookup.as_ref();
         preflight::validate_source(
             reader,
             &self.source_path,
@@ -234,6 +270,12 @@ where
             &self.source,
             self.identities.session_id,
             certified_prefix_end,
+            &|event_id| match base_lookup {
+                Some(lookup) => lookup
+                    .contains(event_id.as_uuid())
+                    .map_err(|error| CaptureError::InvalidPayload(error.to_string())),
+                None => Ok(false),
+            },
             &mut self.duplicate_plan,
         )
     }
@@ -247,6 +289,7 @@ where
             CaptureProvider::Claude,
             self.source_path.clone(),
         );
+        self.append_base_lookup = None;
         self.fallback_identities = JsonlAppendOccurrenceState::default();
     }
 
@@ -388,7 +431,7 @@ where
     }
 
     fn provider_checkpoint(&self) -> Result<Option<TypedKey>> {
-        Ok(None)
+        direct_append_checkpoint().map(Some)
     }
 
     fn rejected_records(&self) -> u64 {

@@ -3,8 +3,9 @@ use ctx_history_provider_codex::codex::catalog::is_codex_session_rollout_path;
 
 impl SourceBackedWatchCatalog {
     /// Proves that an existing unaliased file cannot be a member of one known
-    /// Codex session-tree route. Callers must retain control, rescan and rearm
-    /// events: this path observation alone cannot classify topology changes.
+    /// Codex session-tree or Claude projects-tree route. Callers must retain
+    /// control, rescan and rearm events: this path observation alone cannot
+    /// classify topology changes.
     pub fn event_is_known_non_source_file(
         &self,
         route: &SourceRouteIdentity,
@@ -13,10 +14,7 @@ impl SourceBackedWatchCatalog {
         let Some(targets) = self.routes.get(route) else {
             return false;
         };
-        if targets.kind != Some(SourceBackedWatchTargetKind::Path)
-            || targets.control.is_some()
-            || is_codex_session_rollout_path(event)
-        {
+        if targets.kind != Some(SourceBackedWatchTargetKind::Path) || targets.control.is_some() {
             return false;
         }
         let Some(registrations) = targets.registration_sources.as_ref() else {
@@ -28,10 +26,20 @@ impl SourceBackedWatchCatalog {
         let Some(root) = roots.next() else {
             return false;
         };
-        if roots.next().is_some()
+        let member_name = match (root.source.provider, root.source.source_format.as_ref()) {
+            (CaptureProvider::Codex, "codex_session_jsonl_tree") => {
+                is_codex_session_rollout_path(event)
+            }
+            // Claude Code keeps titles, subagent metadata and tool-result blobs
+            // beside its transcripts; discovery admits only `.jsonl` members.
+            (CaptureProvider::Claude, "claude_projects_jsonl_tree") => {
+                event.extension() == Some(std::ffi::OsStr::new("jsonl"))
+            }
+            _ => return false,
+        };
+        if member_name
+            || roots.next().is_some()
             || root.path_kind != RegisteredPathKind::Directory
-            || root.source.provider != CaptureProvider::Codex
-            || root.source.source_format != "codex_session_jsonl_tree"
             || !registration_source_is_available(root)
         {
             return false;

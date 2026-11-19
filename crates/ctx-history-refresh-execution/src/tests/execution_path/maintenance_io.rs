@@ -424,3 +424,148 @@ fn session_meta(owner: &str) -> Value {
 fn message(text: &str) -> Value {
     json!({"timestamp":"2026-08-17T00:00:01Z", "type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":text}]}})
 }
+
+const CLAUDE_SESSION: &str = "claude-large-live-session";
+
+fn claude_row(uuid: &str, text: &str) -> Value {
+    json!({"type":"user", "uuid":uuid, "sessionId":CLAUDE_SESSION,
+        "message":{"role":"user", "content":text}})
+}
+
+fn claude_admission(root: &Path, discovery: &DiscoveryContext) -> AdmittedRefresh {
+    source_backed_admitted_discovery_from_report(
+        discovery,
+        DiscoveryReport {
+            sources: vec![provider_source_for_path(
+                CaptureProvider::Claude,
+                root.join("projects"),
+            )],
+            issues: Vec::new(),
+        },
+        StdDuration::ZERO,
+        &root.join("data"),
+        AdmittedRefreshCoverage::CompleteCatalog,
+        None,
+        &TestPublishedState,
+    )
+    .unwrap()
+}
+
+fn claude_member_refresh(
+    root: &Path,
+    discovery: &DiscoveryContext,
+    member: &Path,
+) -> SourceBackedRefreshPublication {
+    let catalog = claude_admission(root, discovery)
+        .discovery()
+        .watch_catalog()
+        .clone();
+    let routes = catalog.route_ids().cloned().collect::<BTreeSet<_>>();
+    let route = routes.first().unwrap().clone();
+    let admitted =
+        AdmittedRefresh::from_exact_catalog_authority(routes, StdDuration::ZERO, catalog)
+            .unwrap()
+            .with_execution_facts(BTreeMap::from([(
+                route,
+                SourceBackedRefreshWorkset::members([member.to_path_buf()]),
+            )]))
+            .unwrap();
+    refresh(root, discovery, admitted).0
+}
+
+fn claude_hits(root: &Path, term: &str) -> usize {
+    VerifiedIndex::open_pinned(source_backed_index_root(&root.join("data")))
+        .unwrap()
+        .complete_lexical_search(term, 64)
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn large_live_claude_transcript_reads_only_new_suffixes_across_cycles() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("projects").join("project");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join(format!("{CLAUDE_SESSION}.jsonl"));
+    let padding = "padding ".repeat(256);
+    fs::write(
+        &path,
+        jsonl((0..5_000).map(|index| claude_row(&format!("old-{index}"), &padding))),
+    )
+    .unwrap();
+    let initial_bytes = fs::metadata(&path).unwrap().len();
+    assert!(initial_bytes > 8 * 1024 * 1024);
+    // A sibling transcript must stay closed while only `path` changes.
+    let peer = project.join("claude-idle-peer.jsonl");
+    fs::write(
+        &peer,
+        jsonl([
+            json!({"type":"user", "uuid":"peer-0", "sessionId":"claude-idle-peer",
+            "message":{"role":"user", "content":"peermarker"}}),
+        ]),
+    )
+    .unwrap();
+    let (_, _, discovery) = discovery_fixture(root);
+    ctx_history_platform::platform_security::establish_private_data_root(&root.join("data"))
+        .unwrap();
+    refresh(root, &discovery, claude_admission(root, &discovery));
+
+    for cycle in 0..4 {
+        let suffix = jsonl([claude_row(
+            &format!("live-{cycle}"),
+            "claudeliveappendmarker",
+        )]);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&suffix)
+            .unwrap();
+        let reads = track_source_reads(&path);
+        let peer_reads = track_source_reads(&peer);
+        claude_member_refresh(root, &discovery, &path);
+        eprintln!(
+            "claude live cycle {cycle}: source_reads={} appended={}",
+            reads.bytes(),
+            suffix.len()
+        );
+        assert!(
+            reads.bytes() < 32 * 1024,
+            "cycle {cycle} read {} bytes for {} appended bytes",
+            reads.bytes(),
+            suffix.len()
+        );
+        assert_eq!(peer_reads.bytes(), 0);
+        assert_eq!(claude_hits(root, "claudeliveappendmarker"), cycle + 1);
+    }
+
+    // A suffix that repeats a published event id cannot extend the certified
+    // prefix; the whole source is replaced under the whole-source duplicate plan.
+    let repeated = jsonl([claude_row("live-0", "claudeduplicatemarker")]);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&repeated)
+        .unwrap();
+    let reads = track_source_reads(&path);
+    claude_member_refresh(root, &discovery, &path);
+    assert!(reads.bytes() >= initial_bytes);
+    let after_duplicate = (
+        claude_hits(root, "claudeliveappendmarker"),
+        claude_hits(root, "claudeduplicatemarker"),
+    );
+    assert_eq!(after_duplicate.0 + after_duplicate.1, 4);
+
+    // The member result must match what an exhaustive refresh publishes.
+    refresh(root, &discovery, claude_admission(root, &discovery));
+    assert_eq!(
+        (
+            claude_hits(root, "claudeliveappendmarker"),
+            claude_hits(root, "claudeduplicatemarker"),
+        ),
+        after_duplicate
+    );
+    assert_eq!(claude_hits(root, "peermarker"), 1);
+}

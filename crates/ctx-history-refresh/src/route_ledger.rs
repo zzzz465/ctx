@@ -1,6 +1,8 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    sync::OnceLock,
 };
 
 use ctx_history_index::SourceRouteIdentity;
@@ -12,6 +14,32 @@ use backoff::retry_delay_ms;
 
 const DEBOUNCE_MS: u64 = 250;
 const MAX_EVENT_LATENCY_MS: u64 = 2_000;
+
+/// Lower bound, in seconds, between the admission of one successful capture of
+/// a route and the next capture of that same route. Unset keeps the built-in
+/// event latency bound.
+pub const MIN_REFRESH_INTERVAL_SECONDS_ENV: &str = "CTX_DAEMON_MIN_REFRESH_INTERVAL_SECONDS";
+const MAX_MIN_REFRESH_INTERVAL_SECONDS: u64 = 3_600;
+
+fn success_cadence_ms() -> u64 {
+    static CADENCE_MS: OnceLock<u64> = OnceLock::new();
+    *CADENCE_MS.get_or_init(|| {
+        configured_success_cadence_ms(std::env::var_os(MIN_REFRESH_INTERVAL_SECONDS_ENV))
+    })
+}
+
+fn configured_success_cadence_ms(value: Option<OsString>) -> u64 {
+    value
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| {
+            seconds
+                .min(MAX_MIN_REFRESH_INTERVAL_SECONDS)
+                .saturating_mul(1_000)
+                .max(MAX_EVENT_LATENCY_MS)
+        })
+        .unwrap_or(MAX_EVENT_LATENCY_MS)
+}
 
 /// Monotonic position in one watcher's event stream.
 ///
@@ -90,13 +118,17 @@ impl DirtyRouteState {
     }
 
     fn due_at_ms(&self, coalesce_until_ms: u64) -> u64 {
+        self.due_at_ms_with_cadence(coalesce_until_ms, success_cadence_ms())
+    }
+
+    fn due_at_ms_with_cadence(&self, coalesce_until_ms: u64, cadence_ms: u64) -> u64 {
         let debounce_due = self
             .last_event_at_ms
             .saturating_add(DEBOUNCE_MS)
             .min(self.first_event_at_ms.saturating_add(MAX_EVENT_LATENCY_MS));
         self.retry_not_before_ms
             .unwrap_or(0)
-            .max(coalesce_until_ms.min(self.first_event_at_ms.saturating_add(MAX_EVENT_LATENCY_MS)))
+            .max(coalesce_until_ms.min(self.first_event_at_ms.saturating_add(cadence_ms)))
             .max(debounce_due)
     }
 
@@ -611,7 +643,7 @@ impl DirtySourceRoutes {
             admission.route.clone(),
             admission
                 .admitted_at_ms
-                .saturating_add(MAX_EVENT_LATENCY_MS),
+                .saturating_add(success_cadence_ms()),
         );
         if should_remove {
             self.dirty.remove(&admission.route);
@@ -995,5 +1027,46 @@ mod tests {
         assert_eq!(reactivated.route(), &blocked);
         assert!(ledger.acknowledge(&reactivated));
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn success_cadence_defaults_to_event_latency_bound() {
+        assert_eq!(configured_success_cadence_ms(None), MAX_EVENT_LATENCY_MS);
+        for invalid in ["", "abc", "-1", "1.5"] {
+            assert_eq!(
+                configured_success_cadence_ms(Some(OsString::from(invalid))),
+                MAX_EVENT_LATENCY_MS
+            );
+        }
+    }
+
+    #[test]
+    fn success_cadence_is_bounded_between_event_latency_and_one_hour() {
+        let cadence = |value: &str| configured_success_cadence_ms(Some(OsString::from(value)));
+        assert_eq!(cadence("0"), MAX_EVENT_LATENCY_MS);
+        assert_eq!(cadence("1"), MAX_EVENT_LATENCY_MS);
+        assert_eq!(cadence("300"), 300_000);
+        assert_eq!(cadence("999999"), 3_600_000);
+    }
+
+    #[test]
+    fn longer_success_cadence_defers_repeat_capture_but_not_first_event() {
+        let cadence_ms = 300_000;
+        // An idle route has no cadence deadline; only the debounce applies.
+        let idle = DirtyRouteState::new(1, 1, 10_000);
+        assert_eq!(idle.due_at_ms_with_cadence(0, cadence_ms), 10_250);
+
+        // A route captured at 0 that receives new data at 50 s waits for the
+        // cadence deadline instead of the two-second event latency bound.
+        let repeat = DirtyRouteState::new(2, 2, 50_000);
+        assert_eq!(repeat.due_at_ms_with_cadence(300_000, cadence_ms), 300_000);
+        assert_eq!(
+            repeat.due_at_ms_with_cadence(300_000, MAX_EVENT_LATENCY_MS),
+            52_000
+        );
+
+        // Data that first arrives after the deadline is not delayed further.
+        let late = DirtyRouteState::new(3, 3, 400_000);
+        assert_eq!(late.due_at_ms_with_cadence(300_000, cadence_ms), 400_250);
     }
 }
